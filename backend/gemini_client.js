@@ -1,60 +1,49 @@
-import fetch from 'node-fetch';
-const API_URL = 'https://api.openai.com/v1/responses';
-const KEY = process.env.OPENAI_API_KEY || '';
+// gemini_client.js
+// Direct REST API call to Gemini (no SDK)
 
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${API_KEY}`;
 
 export async function callGemini(prompt, options = {}) {
-if (!KEY) return mockGemini(prompt, options);
+  try {
     const body = {
-    model: options.model || 'gpt-5-mini',
-    input: prompt,
-    max_tokens: options.max_tokens || 400,
-    temperature: typeof options.temperature === 'number' ? options.temperature : 0.0
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: options.temperature ?? 0,
+        maxOutputTokens: options.max_tokens ?? 500,
+      },
     };
 
-
-    const resp = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${KEY}`
-    },
-    body: JSON.stringify(body)
+    const res = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
 
-
-    const j = await resp.json();
-    return j;
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Gemini API error: ${res.status} ${res.statusText} - ${errText}`);
     }
 
+    const data = await res.json();
 
-// deterministic mock for offline testing
-    function mockGemini(prompt, options) {
-    // simple heuristics: if contains 'concern', 'too broad', 'unclear' etc -> Negative
-    const text = (prompt || '').toLowerCase();
-    let sentiment = 'Neutral';
-    let confidence = 0.85;
-    if (/too broad|overbroad|concern|danger|risk|problem|unclear|vague|oppose|against/.test(text)) {
-    sentiment = 'Negative';
-    confidence = 0.9;
-    } else if (/support|welcome|positive|agree|benefit|improve|good|happy/.test(text)) {
-    sentiment = 'Positive';
-    confidence = 0.9;
-    }
+    // Extract plain text from Gemini’s response
+    const text =
+      data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-
-// overall summary mock: pick top phrases
-    const response = {
-    mock: true,
-    output: {
-    text: JSON.stringify({
-    sentiment,
-    confidence,
-    draft_summary: 'Overall, the consultation received mixed feedback with concerns focused on definitions and clarity.',
-    top_themes: ['Definitions','Clarity'],
-    priority_recommendation: 'Clarify terms and narrow ambiguous definitions in key sections.'
-    })
-    }
-    };
-    return response;
-    }
+    return { text, raw: data };
+  } catch (err) {
+    console.error("❌ Gemini fetch failed:", err);
+    throw err;
+  }
+}

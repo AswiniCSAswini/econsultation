@@ -18,43 +18,69 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// Helper: build prompt for a single comment
-function buildCommentPrompt(comment, draftTitle = '') {
-  const safe = comment.replace(/\n/g, ' ').replace(/"/g, '\\"').slice(0, 1800);
+/**
+ * Helper: build prompt for batch comment classification
+ */
+function buildBatchCommentPrompt(comments, draftTitle = '') {
+  const safe = comments.map((c, i) => {
+    const text = c.comment_text.replace(/\n/g, ' ').replace(/"/g, '\\"').slice(0, 800);
+    return `${i + 1}) ID:${c.id} "${text}"`;
+  }).join('\n');
+
   return `You are an assistant that classifies public consultation comments relative to a policy draft.
-COMMENT: "${safe}"
+
 DRAFT_TITLE: "${draftTitle}"
-Task: Return ONLY a JSON object with these exact fields:
-{"sentiment":"Positive" | "Neutral" | "Negative", "confidence":0.00}
-Do NOT include any other text.`;
+
+COMMENTS:
+${safe}
+
+Task: For each comment, return ONLY a JSON array of objects like this:
+[
+  {"id": <commentId>, "sentiment":"Positive" | "Neutral" | "Negative", "confidence":0.00}
+]`;
 }
 
-// Helper: build overall summary prompt
-function buildOverallPrompt({ title, total_comments, sentiment_counts, top_phrases, sample_comments }) {
+/**
+ * Helper: build overall draft analysis prompt
+ */
+function buildOverallPrompt({ title, total_comments, sentiment_counts, top_phrases, sample_comments, stakeholders }) {
   const sc = JSON.stringify(sentiment_counts);
   const phrases = (top_phrases || []).slice(0, 12).map(p => p.word).join(', ');
   const sampleText = (sample_comments || []).map((s, i) => `${i + 1}) ${s.replace(/\n/g, ' ').slice(0, 600)}`).join('\n');
+  const stakeholderText = JSON.stringify(stakeholders);
+
   return `You are an expert policy analyst.
 
 DRAFT_TITLE: ${title}
 TOTAL_COMMENTS: ${total_comments}
 SENTIMENT_COUNTS: ${sc}
 TOP_PHRASES: ${phrases}
+STAKEHOLDER_COMMENTS: ${stakeholderText}
+
 SAMPLE_COMMENTS:
 ${sampleText}
 
 Task:
-Write an executive summary (2-4 sentences) that:
-1) States the overall sentiment (e.g., mostly negative / mixed / mostly positive).
-2) Identifies the top 2 themes that require attention.
-3) Gives one prioritized, concise recommendation for officials.
+1) Give overall sentiment (positive / mixed / negative).
+2) Identify top 2 themes requiring attention.
+3) Provide one clear recommendation for officials.
+4) Suggest at least one perspective from citizens and one from government stakeholders.
 
-Return ONLY a JSON object with keys:
-{"draft_summary":"...","top_themes":["..."],"priority_recommendation":"..."}
-Do not include extra text.`;
+Return ONLY JSON:
+{
+  "draft_summary":"...",
+  "top_themes":["..."],
+  "priority_recommendation":"...",
+  "stakeholder_suggestions": {
+     "citizens": ["..."],
+     "government": ["..."]
+  }
+}`;
 }
 
-// Endpoint: trigger analysis for a draft
+/**
+ * Endpoint: trigger analysis for a draft
+ */
 app.post('/api/analyze/:draftId', async (req, res) => {
   const draftId = req.params.draftId;
 
@@ -69,55 +95,59 @@ app.post('/api/analyze/:draftId', async (req, res) => {
     if (commentsErr) throw commentsErr;
     if (!comments || comments.length === 0) return res.status(404).json({ error: 'No comments found for this draft' });
 
-    // 2) Classify comments (batching)
+    // 2) Batch classify comments
     const batchSize = 8;
     for (let i = 0; i < comments.length; i += batchSize) {
-      const batch = comments.slice(i, i + batchSize);
-      for (const c of batch) {
-        if (c.analyzed_at) continue;
-        const prompt = buildCommentPrompt(c.comment_text, c.title || '');
-        const g = await callGemini(prompt, { temperature: 0.0, max_tokens: 200 });
+      const batch = comments.slice(i, i + batchSize).filter(c => !c.analyzed_at);
+      if (batch.length === 0) continue;
 
-        let sentiment = 'Neutral';
-        let confidence = 0.75;
+      const prompt = buildBatchCommentPrompt(batch, comments[0]?.title || '');
+      const g = await callGemini(prompt, { temperature: 0.0, max_tokens: 600 });
 
-        try {
-          if (g && g.output && g.output.text) {
-            const obj = JSON.parse(g.output.text);
-            sentiment = obj.sentiment || sentiment;
-            confidence = typeof obj.confidence === 'number' ? obj.confidence : confidence;
-          }
-        } catch {}
+      // Robust parsing of Gemini batch response
+      let results = [];
+      try {
+        if (g.text) {
+          const cleaned = g.text.replace(/```(json)?/gi, '').trim();
+          results = JSON.parse(cleaned);
+        }
+      } catch (err) {
+        console.warn("❌ Could not parse Gemini response for batch:", g.text, err);
+      }
 
-        // Persist comment analysis
-        await supabase.from('comments').update({
-          sentiment,
-          confidence,
-          gemini_response: g,
-          analyzed_at: new Date().toISOString()
-        }).eq('id', c.id);
+      if (results && Array.isArray(results)) {
+        for (const r of results) {
+          await supabase.from('comments').update({
+            sentiment: r.sentiment || 'Neutral',
+            confidence: r.confidence || 0.75,
+            gemini_response: g,
+            analyzed_at: new Date().toISOString()
+          }).eq('id', r.id);
+        }
       }
     }
 
     // 3) Aggregates
-    const { data: counts } = await supabase
-      .from('comments')
-      .select('sentiment, count:id', { count: 'exact' })
-      .eq('draft_id', draftId)
-      .group('sentiment');
-
-    const sentiment_counts = {};
-    if (counts) counts.forEach(r => sentiment_counts[r.sentiment || 'Neutral'] = parseInt(r.count, 10));
-
     const { data: allComments } = await supabase
       .from('comments')
-      .select('comment_text, sentiment, id, stakeholder_type, analyzed_at')
+      .select('id, comment_text, sentiment, stakeholder_type, analyzed_at')
       .eq('draft_id', draftId)
       .order('id', { ascending: true });
+
+    const sentiment_counts = {};
+    allComments.forEach(r => {
+      sentiment_counts[r.sentiment || 'Neutral'] = (sentiment_counts[r.sentiment || 'Neutral'] || 0) + 1;
+    });
 
     const texts = allComments.map(r => r.comment_text);
     const top_keywords = computeKeywords(texts, 60);
     const sample_comments = sampleRepresentativeComments(allComments, sentiment_counts);
+
+    // Group stakeholders for summary
+    const stakeholders = {
+      citizens: allComments.filter(c => c.stakeholder_type === 'citizen').slice(0, 5).map(c => c.comment_text),
+      government: allComments.filter(c => c.stakeholder_type === 'government').slice(0, 5).map(c => c.comment_text)
+    };
 
     // 4) Overall summary
     const { data: draftRes } = await supabase.from('drafts').select('title').eq('id', draftId).single();
@@ -128,32 +158,39 @@ app.post('/api/analyze/:draftId', async (req, res) => {
       total_comments: allComments.length,
       sentiment_counts,
       top_phrases: top_keywords,
-      sample_comments
+      sample_comments,
+      stakeholders
     });
 
-    const overallResp = await callGemini(overallPrompt, { temperature: 0.0, max_tokens: 400 });
+    const overallResp = await callGemini(overallPrompt, { temperature: 0.0, max_tokens: 600 });
 
+    // Robust parsing for overall summary
     let draft_summary = '';
     let top_themes = [];
     let priority_recommendation = '';
+    let stakeholder_suggestions = {};
     try {
-      if (overallResp && overallResp.output && overallResp.output.text) {
-        const obj = JSON.parse(overallResp.output.text);
+      if (overallResp.text) {
+        const cleaned = overallResp.text.replace(/```(json)?/gi, '').trim();
+        const obj = JSON.parse(cleaned);
         draft_summary = obj.draft_summary || '';
         top_themes = obj.top_themes || [];
         priority_recommendation = obj.priority_recommendation || '';
+        stakeholder_suggestions = obj.stakeholder_suggestions || {};
       }
-    } catch {
+    } catch (err) {
+      console.warn("❌ Could not parse overall Gemini response:", overallResp.text, err);
       draft_summary = 'Summary unavailable (parse error).';
     }
 
-    // Persist analysis run
+    // 5) Persist analysis run
     await supabase.from('draft_analysis_run').insert([{
       draft_id: draftId,
       total_comments: allComments.length,
       sentiment_counts,
       top_keywords,
       draft_summary,
+      stakeholder_suggestions,
       gemini_response: overallResp
     }]);
 
@@ -163,7 +200,8 @@ app.post('/api/analyze/:draftId', async (req, res) => {
       top_keywords,
       draft_summary,
       top_themes,
-      priority_recommendation
+      priority_recommendation,
+      stakeholder_suggestions
     });
   } catch (err) {
     console.error(err);
@@ -185,21 +223,17 @@ app.get('/api/drafts', async (req, res) => {
 app.get('/api/drafts/:id/analysis', async (req, res) => {
   const id = req.params.id;
   try {
-    const { data: counts } = await supabase
-      .from('comments')
-      .select('sentiment, count:id', { count: 'exact' })
-      .eq('draft_id', id)
-      .group('sentiment');
-
-    const sentiment_counts = {};
-    if (counts) counts.forEach(r => sentiment_counts[r.sentiment || 'Neutral'] = parseInt(r.count, 10));
-
     const { data: comments } = await supabase
       .from('comments')
-      .select('id, comment_text, stakeholder_type, sentiment, confidence, draft_sections(section_code)')
+      .select('id, comment_text, stakeholder_type, sentiment, confidence, sections(section_code)')
       .eq('draft_id', id)
       .order('id', { ascending: true })
       .limit(200);
+
+    const sentiment_counts = {};
+    comments.forEach(r => {
+      sentiment_counts[r.sentiment || 'Neutral'] = (sentiment_counts[r.sentiment || 'Neutral'] || 0) + 1;
+    });
 
     const { data: runs } = await supabase
       .from('draft_analysis_run')
@@ -219,4 +253,4 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 // Start server
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server listening on ${PORT}`));
